@@ -2441,7 +2441,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     // every platform so the read-back sites stay platform-agnostic; only the
     // Windows paths ever populate it.
     #[allow(unused_variables)]
-    let mut paste_burst_delivered: Option<(String, Instant)> = None;
+    let mut paste_gesture = PasteGesture::default();
 
     // Track whether a modified Enter Press was already handled this keypress
     // cycle.  WezTerm sends Shift+Enter as Release-only (no Press), so we
@@ -3085,7 +3085,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                             input_log("paste", &format!("paste CONFIRMED (top), sending {} chars as send-paste: {:?}",
                                 paste_pend.len(), &paste_pend.chars().take(200).collect::<String>()));
                         }
-                        record_paste_delivery(&mut paste_burst_delivered, &paste_pend);
+                        paste_gesture.record(&paste_pend);
                         let encoded = base64_encode(&paste_pend);
                         cmd_batch.push(format!("send-paste {}\n", encoded));
                         // Suppress clipboard-read fallback
@@ -3095,6 +3095,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     paste_pend_start = None;
                     paste_stage2 = false;
                     paste_confirmed = false;
+                    paste_gesture.finish();
                 } else if !paste_stage2 && elapsed > Duration::from_millis(20) {
                     // 20ms window expired
                     let has_non_ascii = paste_pend.chars().any(|c| !c.is_ascii());
@@ -3126,7 +3127,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         // A burst delivered as typing can still be a clipboard
                         // paste (the Ctrl+V Release read-back would then paste
                         // the same text twice), so remember what went out.
-                        record_paste_delivery(&mut paste_burst_delivered, &paste_pend);
+                        paste_gesture.record(&paste_pend);
                         for c in paste_pend.chars() {
                             match c {
                                 '\n' => { cmd_batch.push("send-key enter\n".into()); }
@@ -3152,7 +3153,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         // Even a 1-2 character burst can be a clipboard paste
                         // ("ab" pasted twice is the same bug as a CJK word), so
                         // remember it for the read-back check.
-                        record_paste_delivery(&mut paste_burst_delivered, &paste_pend);
+                        paste_gesture.record(&paste_pend);
                         for c in paste_pend.chars() {
                             match c {
                                 '\n' => { cmd_batch.push("send-key enter\n".into()); }
@@ -3185,7 +3186,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         if input_log_enabled() {
                             input_log("paste", &format!("stage2 timeout, sending {} chars as send-paste", paste_pend.len()));
                         }
-                        record_paste_delivery(&mut paste_burst_delivered, &paste_pend);
+                        paste_gesture.record(&paste_pend);
                         let encoded = base64_encode(&paste_pend);
                         cmd_batch.push(format!("send-paste {}\n", encoded));
                         paste_pend.clear();
@@ -3351,7 +3352,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     _ => false,
                                 };
                                 if !is_bufferable {
-                                    flush_paste_pend_as_text(&mut paste_pend, &mut paste_pend_start, &mut paste_stage2, &mut cmd_batch, &mut paste_burst_delivered);
+                                    flush_paste_pend_as_text(&mut paste_pend, &mut paste_pend_start, &mut paste_stage2, &mut cmd_batch, &mut paste_gesture);
                                 }
                             }
                         }
@@ -4947,7 +4948,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 {
                                     if let Some(text) = read_from_system_clipboard() {
                                         if !text.is_empty() {
-                                            record_paste_delivery(&mut paste_burst_delivered, &text);
+                                            paste_gesture.record(&text);
                                             let encoded = base64_encode(&text);
                                             cmd_batch.push(format!("send-paste {}\n", encoded));
                                         }
@@ -4993,7 +4994,12 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 // handles them.  When paste-detection is off, forward C-v
                                 // to the child app (e.g. neovim visual block mode).
                                 #[cfg(windows)]
-                                KeyCode::Char('v') if key.modifiers == KeyModifiers::CONTROL && paste_detection_enabled => {}
+                                KeyCode::Char('v') if key.modifiers == KeyModifiers::CONTROL && paste_detection_enabled => {
+                                    // Everything the host injects for this
+                                    // paste belongs to one gesture; a new Press
+                                    // starts a fresh one.
+                                    paste_gesture.start();
+                                }
                                 #[cfg(windows)]
                                 KeyCode::Char('v') if key.modifiers == KeyModifiers::CONTROL && !paste_detection_enabled => {
                                     cmd_batch.push("send-key C-v\n".to_string());
@@ -5124,10 +5130,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                             pane_renaming, &mut pane_title_buf,
                             window_idx_input, &mut window_idx_buf,
                         );
-                        let duplicate = !consumed && duplicates_recent_paste(
-                            &data,
-                            recent_paste_delivery(paste_burst_delivered.as_ref()),
-                        );
+                        let duplicate = !consumed && paste_gesture.blocks(&data);
                         if duplicate {
                             // Windows crossterm can emit Event::Paste *and* the
                             // per-character key events for one Ctrl+V.  When the
@@ -5141,6 +5144,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         } else if !consumed {
                             let encoded = base64_encode(&data);
                             cmd_batch.push(format!("send-paste {}\n", encoded));
+                            paste_gesture.record(&data);
                         }
                         // On Windows, crossterm with EnableBracketedPaste may
                         // emit Event::Paste AND individual Event::Key events
@@ -5472,7 +5476,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     selection_changed = true;
                                     if let Some(text) = read_from_system_clipboard() {
                                         if !text.is_empty() {
-                                            record_paste_delivery(&mut paste_burst_delivered, &text);
+                                            paste_gesture.record(&text);
                                             let encoded = base64_encode(&text);
                                             cmd_batch.push(format!("send-paste {}\n", encoded));
                                         }
@@ -5875,7 +5879,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         "zero-latency flush {} char(s) as typing",
                         paste_pend.len()));
                 }
-                record_paste_delivery(&mut paste_burst_delivered, &paste_pend);
+                paste_gesture.record(&paste_pend);
                 for c in paste_pend.chars() {
                     match c {
                         '\n' => { cmd_batch.push("send-key enter\n".into()); }
@@ -5906,7 +5910,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     input_log("paste", &format!("paste CONFIRMED (post-event), sending {} chars as send-paste: {:?}",
                         paste_pend.len(), &paste_pend.chars().take(200).collect::<String>()));
                 }
-                record_paste_delivery(&mut paste_burst_delivered, &paste_pend);
+                paste_gesture.record(&paste_pend);
                 let encoded = base64_encode(&paste_pend);
                 cmd_batch.push(format!("send-paste {}\n", encoded));
                 paste_pend.clear();
@@ -5916,6 +5920,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 // Suppress subsequent char accumulation and clipboard-read
                 // fallback — the paste was already delivered.
                 paste_suppress_until = Some(Instant::now() + Duration::from_millis(200));
+                paste_gesture.finish();
             } else if paste_confirmed && paste_pend.is_empty() {
                 // Ctrl+V Release with no buffered chars.  If paste was
                 // already sent via stage2 timeout or Event::Paste, the
@@ -5925,10 +5930,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 if !suppressed {
                     // No recent paste — read clipboard as fallback
                     if let Some(text) = read_from_system_clipboard() {
-                        if duplicates_recent_paste(
-                            &text,
-                            recent_paste_delivery(paste_burst_delivered.as_ref()),
-                        ) {
+                        if paste_gesture.blocks(&text) {
                             // The same text already went out as a burst of
                             // characters for this very Ctrl+V; reading the
                             // clipboard again here is the duplicate paste.
@@ -5937,6 +5939,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                     "paste CONFIRMED (no buffer): dropping read-back duplicate of {} char(s)",
                                     text.len()));
                             }
+                            // The delivery already happened, so keep a phantom
+                            // Release from reading the clipboard again.
+                            paste_suppress_until = Some(Instant::now() + Duration::from_millis(200));
                         } else if !text.is_empty() {
                             if input_log_enabled() {
                                 input_log("paste", &format!("paste CONFIRMED (no buffer), clipboard read len={}", text.len()));
@@ -5951,6 +5956,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                     }
                 }
                 paste_confirmed = false;
+                paste_gesture.finish();
             }
         }
 
@@ -7964,7 +7970,7 @@ fn flush_paste_pend_as_text(
     paste_pend_start: &mut Option<Instant>,
     paste_stage2: &mut bool,
     cmd_batch: &mut Vec<String>,
-    delivered: &mut Option<(String, Instant)>,
+    gesture: &mut PasteGesture,
 ) {
     if paste_pend.is_empty() {
         return;
@@ -7974,7 +7980,7 @@ fn flush_paste_pend_as_text(
     // wraps it in bracketed paste sequences (fixes nvim autoindent).
     // Non-ASCII buffers (IME input) are always flushed as normal text to
     // avoid the 300ms delay (fixes #91).
-    record_paste_delivery(delivered, paste_pend);
+    gesture.record(paste_pend);
     let has_non_ascii = paste_pend.chars().any(|c| !c.is_ascii());
     if (*paste_stage2 || paste_pend.len() >= 3) && !has_non_ascii {
         let encoded = crate::util::base64_encode(paste_pend);
@@ -8039,11 +8045,63 @@ fn should_zero_latency_flush_paste_pend(
     paste_pend.len() <= 2
 }
 
-/// How long after a paste-shaped burst was delivered a clipboard read-back of
-/// the same text is treated as a duplicate of it.  The read-back fires from
-/// the Ctrl+V Release of the same gesture, so a few hundred milliseconds is
-/// generous, and keeping it short leaves deliberate repeat pastes alone.
-#[cfg(windows)]
+/// What the client has already forwarded for the paste gesture in flight.
+///
+/// The console host injects a clipboard paste as character events, and crossterm
+/// can additionally emit `Event::Paste` for the very same keystroke, so a
+/// read-back of the clipboard at the end of the gesture would deliver the text a
+/// second time.  Recording it per gesture, rather than only comparing the text,
+/// is what covers a paste the host splits into several bursts: `C2单元格应显示`
+/// can arrive as `C2` (flushed immediately as typing) and then the CJK part, so
+/// what was forwarded no longer equals the clipboard text even though it is the
+/// whole paste.
+#[derive(Default)]
+struct PasteGesture {
+    /// Text of the bursts forwarded so far, with the time the last one went out.
+    delivered: Option<(String, Instant)>,
+    /// True once any of this gesture's characters have been forwarded.
+    injected: bool,
+}
+
+impl PasteGesture {
+    /// A new Ctrl+V started: nothing of this gesture has been forwarded yet.
+    fn start(&mut self) {
+        self.delivered = None;
+        self.injected = false;
+    }
+
+    /// The gesture is over, however it ended.
+    fn finish(&mut self) {
+        self.start();
+    }
+
+    /// Remember `text` as forwarded on behalf of this gesture.
+    fn record(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.injected = true;
+            self.delivered = Some((text.to_string(), Instant::now()));
+        }
+    }
+
+    /// The last forwarded burst and how long ago it went out.
+    fn recent(&self) -> Option<(&str, Duration)> {
+        self.delivered
+            .as_ref()
+            .map(|(text, at)| (text.as_str(), at.elapsed()))
+    }
+
+    /// True when delivering `text` now would repeat this gesture: either its
+    /// characters were already forwarded (whatever they were split into), or
+    /// the same text went out a moment ago.
+    fn blocks(&self, text: &str) -> bool {
+        self.injected || duplicates_recent_paste(text, self.recent())
+    }
+}
+
+/// How long after a burst was forwarded a clipboard read-back of the same text
+/// is treated as a duplicate of it.  The read-back fires from the Ctrl+V Release
+/// of the same gesture, so a few hundred milliseconds is generous, and keeping
+/// it short leaves deliberate repeat pastes alone.
 const PASTE_DUPLICATE_WINDOW: Duration = Duration::from_millis(300);
 
 /// True when `text` is the string a paste-shaped burst just delivered, so
@@ -8052,7 +8110,6 @@ const PASTE_DUPLICATE_WINDOW: Duration = Duration::from_millis(300);
 /// The content is compared, not just the timing: a *different* clipboard
 /// payload is never dropped, and a deliberate repeat paste still reaches the
 /// pane through its own burst of characters.
-#[cfg(windows)]
 fn duplicates_recent_paste(text: &str, recent: Option<(&str, Duration)>) -> bool {
     match recent {
         Some((delivered, age)) => {
@@ -8060,20 +8117,6 @@ fn duplicates_recent_paste(text: &str, recent: Option<(&str, Duration)>) -> bool
         }
         None => false,
     }
-}
-
-/// Remember that `text` just reached the pane as a paste-shaped burst.
-#[cfg(windows)]
-fn record_paste_delivery(slot: &mut Option<(String, Instant)>, text: &str) {
-    if !text.is_empty() {
-        *slot = Some((text.to_string(), Instant::now()));
-    }
-}
-
-/// The age of the last delivered burst, ready for `duplicates_recent_paste`.
-#[cfg(windows)]
-fn recent_paste_delivery(slot: Option<&(String, Instant)>) -> Option<(&str, Duration)> {
-    slot.map(|(text, at)| (text.as_str(), at.elapsed()))
 }
 
 /// Returns true if the buffer contains any non-ASCII characters (IME / CJK input).
